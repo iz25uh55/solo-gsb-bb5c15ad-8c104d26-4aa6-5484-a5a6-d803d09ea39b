@@ -75,6 +75,21 @@ def to_decimal(value: Any, field: str) -> Decimal:
     raise ValueError(f"{field} 必须以字符串形式提交十进制数字，收到: {type(value).__name__}")
 
 
+def normalize_money(value: Decimal, currency: str, digits: int, field: str) -> Decimal:
+    """校验金额是该币种最小单位的整数倍，并规范化为固定币种位数。
+
+    例如 USD（digits=2）下 ``Decimal('100')`` -> ``Decimal('100.00')``，
+    ``Decimal('100.005')`` 抛 ValueError。
+    """
+
+    unit = _unit(digits)
+    if (value / unit) != (value / unit).to_integral_value():
+        raise ValueError(
+            f"{field}={_s(value)} 不是 {currency} 最小单位 {_s(unit)} 的整数倍"
+        )
+    return value.quantize(unit)
+
+
 @dataclass(frozen=True)
 class Allocation:
     """某一币种维度上的残差分配结果。"""
@@ -223,15 +238,10 @@ def compute_invoice(payload: dict[str, Any]) -> dict[str, Any]:
 
     # 净额必须是币种最小单位的整数倍（发票上不存在更小单位）；
     # 通过后统一 quantize 一次，使展示/存储固定为币种位数（1.5 -> 1.50）
-    unit = _unit(digits)
     nets: list[Decimal] = []
     normalized_lines: list[tuple[str | None, Decimal, Decimal]] = []
     for idx, (description, net, rate) in enumerate(lines_in, start=1):
-        if (net / unit) != (net / unit).to_integral_value():
-            raise ValueError(
-                f"lines[{idx}].net={_s(net)} 不是 {currency} 最小单位 {_s(unit)} 的整数倍"
-            )
-        net = net.quantize(unit)
+        net = normalize_money(net, currency, digits, f"lines[{idx}].net")
         nets.append(net)
         normalized_lines.append((description, net, rate))
     lines_in = normalized_lines

@@ -199,6 +199,229 @@ class ApiTests(unittest.TestCase):
         self.assertTrue(os.path.exists(os.environ["DB_PATH"]))
         self.assertGreater(os.path.getsize(os.environ["DB_PATH"]), 0)
 
+    def test_08_payment_flow(self) -> None:
+        # 含税总额 113.00 USD（100 净额 × 13%）
+        status, body = self._request(
+            "POST",
+            "/api/v1/invoices",
+            {"currency": "USD", "lines": [{"net": "100.00", "tax_rate": "0.13"}]},
+        )
+        self.assertEqual(status, 201, body)
+        invoice_id = body["id"]
+        self.assertEqual(body["totals"]["total_gross"], "113.00")
+
+        # 初始：无收款记录，余额即含税总额
+        status, ledger = self._request(
+            "GET", f"/api/v1/invoices/{invoice_id}/payments"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(ledger["currency"], "USD")
+        self.assertEqual(ledger["total_gross"], "113.00")
+        self.assertEqual(ledger["paid_amount"], "0.00")
+        self.assertEqual(ledger["balance_due"], "113.00")
+        self.assertEqual(ledger["payments"], [])
+
+        # 登记第一笔 100
+        status, body = self._request(
+            "POST",
+            f"/api/v1/invoices/{invoice_id}/payments",
+            {"amount": "100", "note": "定金"},
+        )
+        self.assertEqual(status, 201, body)
+        self.assertEqual(body["payment"]["amount"], "100.00")
+        self.assertEqual(body["payment"]["registered_at"][-1], "Z")
+        self.assertEqual(body["paid_amount"], "100.00")
+        self.assertEqual(body["balance_due"], "13.00")
+
+        # 结清尾款 13
+        status, body = self._request(
+            "POST",
+            f"/api/v1/invoices/{invoice_id}/payments",
+            {"amount": "13.00"},
+        )
+        self.assertEqual(status, 201, body)
+        self.assertEqual(body["paid_amount"], "113.00")
+        self.assertEqual(body["balance_due"], "0.00")
+
+        # 台账两条记录，按登记顺序
+        status, ledger = self._request(
+            "GET", f"/api/v1/invoices/{invoice_id}/payments"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(len(ledger["payments"]), 2)
+        self.assertEqual([p["amount"] for p in ledger["payments"]], ["100.00", "13.00"])
+        self.assertEqual(ledger["balance_due"], "0.00")
+
+    def test_09_payment_overpayment_rejected(self) -> None:
+        status, body = self._request(
+            "POST",
+            "/api/v1/invoices",
+            {"currency": "CNY", "lines": [{"net": "100.00", "tax_rate": "0.13"}]},
+        )
+        self.assertEqual(status, 201, body)
+        invoice_id = body["id"]  # 含税 113.00
+
+        # 单笔超额 -> 422，不留记录
+        status, body = self._request(
+            "POST",
+            f"/api/v1/invoices/{invoice_id}/payments",
+            {"amount": "200.00"},
+        )
+        self.assertEqual(status, 422, body)
+        self.assertIn("detail", body)
+
+        status, ledger = self._request(
+            "GET", f"/api/v1/invoices/{invoice_id}/payments"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(ledger["payments"], [])
+        self.assertEqual(ledger["balance_due"], "113.00")
+
+        # 先收 100，再收 14（累计 114 > 113）-> 422，只保留第一笔
+        status, _ = self._request(
+            "POST", f"/api/v1/invoices/{invoice_id}/payments", {"amount": "100.00"}
+        )
+        self.assertEqual(status, 201)
+        status, body = self._request(
+            "POST", f"/api/v1/invoices/{invoice_id}/payments", {"amount": "14.00"}
+        )
+        self.assertEqual(status, 422, body)
+        status, ledger = self._request(
+            "GET", f"/api/v1/invoices/{invoice_id}/payments"
+        )
+        self.assertEqual(len(ledger["payments"]), 1)
+        self.assertEqual(ledger["paid_amount"], "100.00")
+        self.assertEqual(ledger["balance_due"], "13.00")
+
+        # 恰好等于余额 -> 成功
+        status, body = self._request(
+            "POST", f"/api/v1/invoices/{invoice_id}/payments", {"amount": "13.00"}
+        )
+        self.assertEqual(status, 201, body)
+        self.assertEqual(body["balance_due"], "0.00")
+
+    def test_10_payment_validation_errors(self) -> None:
+        status, invoice = self._request(
+            "POST",
+            "/api/v1/invoices",
+            {"currency": "USD", "lines": [{"net": "100.00", "tax_rate": "0.13"}]},
+        )
+        self.assertEqual(status, 201)
+        invoice_id = invoice["id"]
+
+        # 金额必须大于 0
+        for bad in ("0", "0.00", "-1.00"):
+            status, body = self._request(
+                "POST",
+                f"/api/v1/invoices/{invoice_id}/payments",
+                {"amount": bad},
+            )
+            self.assertEqual(status, 422, bad)
+
+        # 不是十进制字符串
+        status, _ = self._request(
+            "POST",
+            f"/api/v1/invoices/{invoice_id}/payments",
+            {"amount": "abc"},
+        )
+        self.assertEqual(status, 422)
+
+        # 数字类型而非字符串 -> 422
+        status, _ = self._request(
+            "POST",
+            f"/api/v1/invoices/{invoice_id}/payments",
+            {"amount": 10},
+        )
+        self.assertEqual(status, 422)
+
+        # 非币种最小单位整数倍（USD 下 0.001）
+        status, body = self._request(
+            "POST",
+            f"/api/v1/invoices/{invoice_id}/payments",
+            {"amount": "10.001"},
+        )
+        self.assertEqual(status, 422, body)
+
+        # 发票不存在：查询/登记均 404
+        status, _ = self._request("GET", "/api/v1/invoices/999999/payments")
+        self.assertEqual(status, 404)
+        status, _ = self._request(
+            "POST", "/api/v1/invoices/999999/payments", {"amount": "1.00"}
+        )
+        self.assertEqual(status, 404)
+
+    def test_11_payment_jpy_minor_unit(self) -> None:
+        # JPY 为 0 位小数币种：含税 110 日元
+        status, body = self._request(
+            "POST",
+            "/api/v1/invoices",
+            {"currency": "JPY", "lines": [{"net": "100", "tax_rate": "0.10"}]},
+        )
+        self.assertEqual(status, 201, body)
+        invoice_id = body["id"]
+
+        status, body = self._request(
+            "POST",
+            f"/api/v1/invoices/{invoice_id}/payments",
+            {"amount": "50.5"},
+        )
+        self.assertEqual(status, 422)  # 不是 1 日元的整数倍
+
+        status, body = self._request(
+            "POST",
+            f"/api/v1/invoices/{invoice_id}/payments",
+            {"amount": "50"},
+        )
+        self.assertEqual(status, 201, body)
+        self.assertEqual(body["payment"]["amount"], "50")
+        self.assertEqual(body["balance_due"], "60")
+
+    def test_12_concurrent_payments_no_overpay(self) -> None:
+        # 含税总额 100.00；20 笔各 10.00 的并发登记，恰好 10 笔成功、10 笔 422
+        status, body = self._request(
+            "POST",
+            "/api/v1/invoices",
+            {"currency": "USD", "lines": [{"net": "100.00", "tax_rate": "0"}]},
+        )
+        self.assertEqual(status, 201, body)
+        invoice_id = body["id"]
+
+        results: list[int] = []
+        barrier = threading.Barrier(21)
+        results_lock = threading.Lock()
+
+        def pay() -> None:
+            barrier.wait()
+            req = urllib.request.Request(
+                f"{self.base}/api/v1/invoices/{invoice_id}/payments",
+                data=json.dumps({"amount": "10.00"}).encode(),
+                method="POST",
+                headers={"Content-Type": "application/json"},
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=15) as resp:
+                    code = resp.status
+            except urllib.error.HTTPError as exc:
+                code = exc.code
+            with results_lock:
+                results.append(code)
+
+        threads = [threading.Thread(target=pay) for _ in range(20)]
+        for t in threads:
+            t.start()
+        barrier.wait()
+        for t in threads:
+            t.join()
+
+        self.assertEqual(sorted(results), [201] * 10 + [422] * 10)
+        status, ledger = self._request(
+            "GET", f"/api/v1/invoices/{invoice_id}/payments"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(len(ledger["payments"]), 10)
+        self.assertEqual(ledger["paid_amount"], "100.00")
+        self.assertEqual(ledger["balance_due"], "0.00")
+
 
 if __name__ == "__main__":
     unittest.main()

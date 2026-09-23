@@ -9,19 +9,23 @@ import json
 import sqlite3
 from collections.abc import AsyncIterator, Iterator
 from contextlib import asynccontextmanager
+from decimal import Decimal
 from typing import Any
 
 from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.responses import JSONResponse
 
 from . import db as database
-from .calc import compute_invoice, recompute_matches
+from .calc import compute_invoice, normalize_money, recompute_matches, to_decimal
 from .currency import UnknownCurrencyError
 from .schemas import (
     Health,
     InvoiceCreate,
     InvoiceResult,
     PagedInvoices,
+    PaymentCreate,
+    PaymentLedger,
+    PaymentResult,
 )
 
 
@@ -208,4 +212,106 @@ def list_invoices(
         "page_size": page_size,
         "total": total,
         "pages": pages,
+    }
+
+
+# ---- 收款登记 ----
+
+def _money_str(value: Decimal, digits: int) -> str:
+    """按币种最小单位规范化输出：USD 下 0 -> '0.00'，JPY 下 0 -> '0'。"""
+
+    return format(value.quantize(Decimal(1).scaleb(-digits)), "f")
+
+
+def _payment_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "id": row["id"],
+        "invoice_id": row["invoice_id"],
+        "amount": row["amount"],
+        "note": row["note"],
+        "registered_at": row["registered_at"],
+    }
+
+
+def _ledger(
+    conn: sqlite3.Connection, invoice_id: int
+) -> tuple[sqlite3.Row | None, dict[str, Any]]:
+    """组装某发票的收款台账（含未收余额）。发票不存在时 row 为 None。"""
+
+    row = database.get_invoice(conn, invoice_id)
+    if row is None:
+        return None, {}
+    digits = int(row["currency_digits"])
+    total_gross = Decimal(row["total_gross"])
+    payments = [_payment_to_dict(r) for r in database.list_payments(conn, invoice_id)]
+    paid_amount = sum((Decimal(p["amount"]) for p in payments), Decimal("0"))
+    return row, {
+        "invoice_id": invoice_id,
+        "currency": row["currency"],
+        "total_gross": _money_str(total_gross, digits),
+        "paid_amount": _money_str(paid_amount, digits),
+        "balance_due": _money_str(total_gross - paid_amount, digits),
+        "payments": payments,
+    }
+
+
+@app.get(
+    "/api/v1/invoices/{invoice_id}/payments",
+    response_model=PaymentLedger,
+    tags=["payments"],
+)
+def list_invoice_payments(
+    invoice_id: int, conn: sqlite3.Connection = Depends(get_db)
+) -> dict[str, Any]:
+    """按发票 id 查询收款记录与未收余额。"""
+
+    row, ledger = _ledger(conn, invoice_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"发票 {invoice_id} 不存在")
+    return ledger
+
+
+@app.post(
+    "/api/v1/invoices/{invoice_id}/payments",
+    response_model=PaymentResult,
+    status_code=201,
+    tags=["payments"],
+)
+def register_invoice_payment(
+    invoice_id: int,
+    payload: PaymentCreate,
+    conn: sqlite3.Connection = Depends(get_db),
+) -> dict[str, Any]:
+    """登记一笔收款。
+
+    金额使用发票币种的十进制字符串、必须大于 0（且为该币种最小单位整数倍）；
+    同一发票累计收款不得超过含税总额，超额返回 422 且不留下记录。
+    """
+
+    row = database.get_invoice(conn, invoice_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"发票 {invoice_id} 不存在")
+
+    currency = row["currency"]
+    digits = int(row["currency_digits"])
+    amount = normalize_money(
+        to_decimal(payload.amount, "amount"), currency, digits, "amount"
+    )
+    if amount <= 0:
+        raise ValueError(f"amount 必须大于 0，收到 {payload.amount!r}")
+
+    # 余额校验与写入在同一个 BEGIN IMMEDIATE 事务内完成，避免并发超收
+    inserted = database.register_payment(conn, invoice_id, amount, payload.note)
+    if inserted is None:
+        # 事务内复查时发票已不存在（极端并发删除）
+        raise HTTPException(status_code=404, detail=f"发票 {invoice_id} 不存在")
+    payment, paid_amount, balance = inserted
+
+    return {
+        "invoice_id": invoice_id,
+        "currency": currency,
+        "total_gross": _money_str(Decimal(row["total_gross"]), digits),
+        "paid_amount": _money_str(paid_amount, digits),
+        "balance_due": _money_str(balance, digits),
+        "payment": _payment_to_dict(payment),
     }
