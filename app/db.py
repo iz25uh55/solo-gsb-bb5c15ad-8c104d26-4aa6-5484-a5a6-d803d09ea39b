@@ -1,8 +1,9 @@
 """SQLite 持久化层。
 
-存储两张表：
-* ``invoices``    —— 发票头（含原始请求 JSON，用于复算）与汇总金额；
-* ``invoice_lines`` —— 逐行结果（税额残差分配后的最终值，含换算列）。
+存储三张表：
+* ``invoices``      —— 发票头（含原始请求 JSON，用于复算）与汇总金额；
+* ``invoice_lines`` —— 逐行结果（税额残差分配后的最终值，含换算列）；
+* ``payments``      —— 收款登记（每笔收款的金额、币种与登记时间）。
 """
 
 from __future__ import annotations
@@ -11,6 +12,7 @@ import json
 import os
 import sqlite3
 from datetime import datetime, timezone
+from decimal import Decimal
 from typing import Any
 
 SCHEMA = """
@@ -49,7 +51,25 @@ CREATE TABLE IF NOT EXISTS invoice_lines (
 );
 
 CREATE INDEX IF NOT EXISTS idx_invoices_created_at ON invoices(created_at);
+
+CREATE TABLE IF NOT EXISTS payments (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    invoice_id INTEGER NOT NULL REFERENCES invoices(id) ON DELETE CASCADE,
+    amount     TEXT NOT NULL,
+    currency   TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_payments_invoice_id ON payments(invoice_id);
 """
+
+
+class InvoiceNotFoundError(Exception):
+    """收款登记/查询时发票不存在。"""
+
+    def __init__(self, invoice_id: int) -> None:
+        self.invoice_id = invoice_id
+        super().__init__(f"发票 {invoice_id} 不存在")
 
 
 def utc_now_iso() -> str:
@@ -69,7 +89,9 @@ def connect(database: str | None = None) -> sqlite3.Connection:
     parent = os.path.dirname(path)
     if parent:
         os.makedirs(parent, exist_ok=True)
-    conn = sqlite3.connect(path, timeout=30)
+    # check_same_thread=False：FastAPI 的依赖注入与端点可能运行在线程池的
+    # 不同线程；连接始终是每请求一条、单请求内串行使用，跨线程创建/使用是安全的
+    conn = sqlite3.connect(path, timeout=30, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
@@ -167,3 +189,117 @@ def list_invoices(
         ).fetchall()
     )
     return rows, total
+
+
+# ---- 收款登记 ----
+
+
+def _minor_unit(digits: int) -> Decimal:
+    """某币种的 1 个最小单位，例如 digits=2 -> Decimal('0.01')。"""
+
+    return Decimal(1).scaleb(-digits)
+
+
+def _paid_total(conn: sqlite3.Connection, invoice_id: int) -> Decimal:
+    """已收金额合计。用 Decimal 逐笔求和，不走 SQLite 的浮点 SUM 聚合。"""
+
+    rows = conn.execute(
+        "SELECT amount FROM payments WHERE invoice_id = ?", (invoice_id,)
+    ).fetchall()
+    return sum((Decimal(r["amount"]) for r in rows), Decimal("0"))
+
+
+def register_payment(
+    conn: sqlite3.Connection, invoice_id: int, amount: Decimal
+) -> dict[str, Any]:
+    """登记一笔收款：余额校验与写入在 **同一个事务** 中完成。
+
+    使用 ``BEGIN IMMEDIATE`` 在事务开始即取得写锁，把并发的收款请求串行化，
+    「读已收合计 -> 校验未收余额 -> 写入」之间不会被另一笔收款插队，避免超收。
+
+    * 发票不存在 -> :class:`InvoiceNotFoundError`
+    * 金额不是币种最小单位整数倍、或累计收款将超过含税总额 -> ``ValueError``
+      （事务回滚，不留下任何记录；由 API 层映射为 422）
+    """
+
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        inv = conn.execute(
+            "SELECT currency, currency_digits, total_gross FROM invoices WHERE id = ?",
+            (invoice_id,),
+        ).fetchone()
+        if inv is None:
+            raise InvoiceNotFoundError(invoice_id)
+
+        digits = int(inv["currency_digits"])
+        unit = _minor_unit(digits)
+        if (amount / unit) != (amount / unit).to_integral_value():
+            raise ValueError(
+                f"收款金额 {amount} 不是 {inv['currency']} 最小单位 {unit} 的整数倍"
+            )
+        amount = amount.quantize(unit)
+
+        gross = Decimal(inv["total_gross"])
+        paid = _paid_total(conn, invoice_id)
+        outstanding = gross - paid
+        if amount > outstanding:
+            raise ValueError(
+                f"收款 {amount} 超出未收余额 {outstanding}"
+                f"（含税总额 {gross}，已收 {paid}），未登记任何记录"
+            )
+
+        created_at = utc_now_iso()
+        cur = conn.execute(
+            """
+            INSERT INTO payments (invoice_id, amount, currency, created_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (invoice_id, format(amount, "f"), inv["currency"], created_at),
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
+    new_paid = paid + amount
+    return {
+        "id": int(cur.lastrowid),
+        "invoice_id": invoice_id,
+        "amount": format(amount, "f"),
+        "currency": inv["currency"],
+        "created_at": created_at,
+        "paid_total": format(new_paid, "f"),
+        "outstanding": format(gross - new_paid, "f"),
+    }
+
+
+def payment_overview(conn: sqlite3.Connection, invoice: sqlite3.Row) -> dict[str, Any]:
+    """某张发票的收款记录列表与未收余额（供 GET 使用）。"""
+
+    rows = list(
+        conn.execute(
+            "SELECT * FROM payments WHERE invoice_id = ? ORDER BY id",
+            (invoice["id"],),
+        ).fetchall()
+    )
+    unit = _minor_unit(int(invoice["currency_digits"]))
+    paid = sum((Decimal(r["amount"]) for r in rows), Decimal("0")).quantize(unit)
+    gross = Decimal(invoice["total_gross"])
+    return {
+        "invoice_id": invoice["id"],
+        "currency": invoice["currency"],
+        "total_gross": invoice["total_gross"],
+        "paid_total": format(paid, "f"),
+        "outstanding": format(gross - paid, "f"),
+        "payment_count": len(rows),
+        "payments": [
+            {
+                "id": r["id"],
+                "invoice_id": r["invoice_id"],
+                "amount": r["amount"],
+                "currency": r["currency"],
+                "created_at": r["created_at"],
+            }
+            for r in rows
+        ],
+    }

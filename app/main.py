@@ -15,13 +15,16 @@ from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.responses import JSONResponse
 
 from . import db as database
-from .calc import compute_invoice, recompute_matches
+from .calc import compute_invoice, recompute_matches, to_decimal
 from .currency import UnknownCurrencyError
 from .schemas import (
     Health,
     InvoiceCreate,
     InvoiceResult,
     PagedInvoices,
+    PaymentCreate,
+    PaymentOverview,
+    PaymentResult,
 )
 
 
@@ -35,10 +38,11 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
 
 app = FastAPI(
     title="发票税额计算 API",
-    version="1.0.0",
+    version="1.1.0",
     description=(
         "基于 Decimal 的发票税额计算服务：按币种最小单位舍入、"
-        "最大余数法分配残差、可复算，支持跨币种换算，SQLite 持久化。"
+        "最大余数法分配残差、可复算，支持跨币种换算、收款登记与未收余额查询，"
+        "SQLite 持久化。"
     ),
     lifespan=lifespan,
 )
@@ -209,3 +213,38 @@ def list_invoices(
         "total": total,
         "pages": pages,
     }
+
+
+@app.post(
+    "/api/v1/invoices/{invoice_id}/payments",
+    response_model=PaymentResult,
+    status_code=201,
+    tags=["payments"],
+)
+def register_payment(
+    invoice_id: int,
+    payload: PaymentCreate,
+    conn: sqlite3.Connection = Depends(get_db),
+) -> dict[str, Any]:
+    amount = to_decimal(payload.amount, "amount")
+    if amount <= 0:
+        # 走全局 ValueError -> 422 处理器
+        raise ValueError(f"收款金额必须大于 0，收到 {payload.amount!r}")
+    try:
+        return database.register_payment(conn, invoice_id, amount)
+    except database.InvoiceNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.get(
+    "/api/v1/invoices/{invoice_id}/payments",
+    response_model=PaymentOverview,
+    tags=["payments"],
+)
+def read_payments(
+    invoice_id: int, conn: sqlite3.Connection = Depends(get_db)
+) -> dict[str, Any]:
+    row = database.get_invoice(conn, invoice_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"发票 {invoice_id} 不存在")
+    return database.payment_overview(conn, row)

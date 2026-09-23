@@ -150,3 +150,48 @@ class PagedInvoices(BaseModel):
 class Health(BaseModel):
     status: str
     database: str
+
+
+# ---- 收款登记 ----
+
+class PaymentCreate(BaseModel):
+    amount: str = Field(
+        description="收款金额，发票币种的十进制字符串，必须大于 0 且为币种最小单位的整数倍，如 '33.11'"
+    )
+
+    @field_validator("amount")
+    @classmethod
+    def _check_amount(cls, v: str) -> str:
+        v = v.strip()
+        if not _DECIMAL_RE.match(v):
+            raise ValueError(f"amount 必须是十进制数字字符串，收到 {v!r}")
+        return v
+
+
+class PaymentOut(BaseModel):
+    model_config = ConfigDict(extra="allow")
+    id: int
+    invoice_id: int
+    amount: str
+    currency: str
+    created_at: str
+
+
+class PaymentResult(PaymentOut):
+    """登记收款成功后的响应：收款记录 + 最新余额。"""
+
+    paid_total: str
+    outstanding: str
+
+
+class PaymentOverview(BaseModel):
+    """按发票查询的收款记录与未收余额。"""
+
+    model_config = ConfigDict(extra="allow")
+    invoice_id: int
+    currency: str
+    total_gross: str
+    paid_total: str
+    outstanding: str
+    payment_count: int
+    payments: list[PaymentOut]

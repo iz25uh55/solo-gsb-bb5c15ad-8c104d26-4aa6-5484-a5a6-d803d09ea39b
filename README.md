@@ -6,6 +6,7 @@
 - **按币种最小单位舍入**：`ROUND_HALF_UP`（四舍五入）。USD/CNY 等按 0.01，JPY/KRW 按 1，KWD/BHD 按 0.001。
 - **残差固定分配且可复算**：发票总额与「逐行舍入后税额之和」的差（残差）按**最大余数法**确定性地分配回具体行，任何时候用同一请求复算结果完全一致（响应中带 `recompute_matched` 标志）。
 - **跨币种换算**：按请求汇率换算，原币金额完整保留，目标币独立做最小单位舍入与残差分配。
+- **收款登记**：按发票登记收款（发票币种字符串、必须大于 0），随时查询收款记录与未收余额；累计收款不得超过含税总额，校验与写入在同一 SQLite 事务中完成，并发不会超收。
 - **SQLite 持久化**（WAL 模式），提供创建、按 id 查询、分页列表、健康检查。
 - 内置 OpenAPI 交互文档（Swagger UI / ReDoc）。
 
@@ -56,6 +57,13 @@ curl -s -X POST http://localhost:8000/api/v1/invoices \
       {"description": "签字笔", "net": "20.05", "tax_rate": "0.10"}
     ]
   }'
+
+# 登记一笔收款并查看未收余额（假设上一步返回的发票 id 为 1）
+curl -s -X POST http://localhost:8000/api/v1/invoices/1/payments \
+  -H 'Content-Type: application/json' \
+  -d '{"amount": "20.00"}'
+
+curl -s http://localhost:8000/api/v1/invoices/1/payments
 ```
 
 该请求每行精确税额为 1.005 / 2.005（逐行 HALF_UP 得 1.01 / 2.01），但总税额
@@ -139,6 +147,8 @@ Base URL：`http://localhost:8000`
 | `POST` | `/api/v1/invoices` | 创建并计算发票（持久化后返回完整结果），`201` |
 | `GET` | `/api/v1/invoices/{id}` | 按 id 查询单张发票（含逐行明细与复算标志） |
 | `GET` | `/api/v1/invoices?page=1&page_size=20` | 分页列表（按 id 倒序），`page_size` 范围 1~100 |
+| `POST` | `/api/v1/invoices/{id}/payments` | 登记一笔收款（发票币种字符串、必须大于 0），`201` |
+| `GET` | `/api/v1/invoices/{id}/payments` | 查询该发票的收款记录与未收余额 |
 | `GET` | `/docs` `/redoc` `/openapi.json` | 交互式 API 文档 |
 
 ### 3.1 创建发票 `POST /api/v1/invoices`
@@ -197,12 +207,70 @@ curl -s 'http://localhost:8000/api/v1/invoices?page=1&page_size=20'
 }
 ```
 
-### 3.3 错误码
+### 3.3 收款登记与未收余额
+
+**登记收款** `POST /api/v1/invoices/{id}/payments`：
+
+| 字段 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `amount` | string | 是 | 收款金额，**发票币种**的十进制字符串；必须 **大于 0**，且为币种最小单位的整数倍（USD 下 `20.00`，JPY 下 `2000`） |
+
+规则：
+
+- 每张发票的**累计收款不得超过含税总额** `total_gross`；超额请求返回 `422`，
+  事务回滚，**不留下任何收款记录**。
+- 余额校验与收款写入在**同一个 SQLite 事务**中完成（`BEGIN IMMEDIATE` 串行化
+  并发写入），并发登记不会超收。
+- 每笔收款保存登记时间 `created_at`（UTC，ISO 8601）。
+
+```bash
+# 登记 20.00 USD（发票 total_gross = 33.11）
+curl -s -X POST http://localhost:8000/api/v1/invoices/1/payments \
+  -H 'Content-Type: application/json' \
+  -d '{"amount": "20.00"}'
+```
+
+响应 `201`（收款记录 + 最新余额）：
+
+```json
+{
+  "id": 1,
+  "invoice_id": 1,
+  "amount": "20.00",
+  "currency": "USD",
+  "created_at": "2026-09-23T02:10:00Z",
+  "paid_total": "20.00",
+  "outstanding": "13.11"
+}
+```
+
+**查询收款记录与未收余额** `GET /api/v1/invoices/{id}/payments`：
+
+```bash
+curl -s http://localhost:8000/api/v1/invoices/1/payments
+```
+
+```json
+{
+  "invoice_id": 1,
+  "currency": "USD",
+  "total_gross": "33.11",
+  "paid_total": "20.00",
+  "outstanding": "13.11",
+  "payment_count": 1,
+  "payments": [
+    {"id": 1, "invoice_id": 1, "amount": "20.00", "currency": "USD",
+     "created_at": "2026-09-23T02:10:00Z"}
+  ]
+}
+```
+
+### 3.4 错误码
 
 | 状态码 | 场景 |
 | --- | --- |
-| `404` | 发票 id 不存在 |
-| `422` | 参数错误：金额非十进制字符串、净额不满足最小单位、税率越界、跨币种缺汇率、未知币种等（响应体 `detail` 为中文说明） |
+| `404` | 发票 id 不存在（含收款登记/查询时） |
+| `422` | 参数错误：金额非十进制字符串、净额不满足最小单位、税率越界、跨币种缺汇率、未知币种、收款金额 ≤ 0、收款小于币种最小单位、累计收款超过含税总额等（响应体 `detail` 为中文说明） |
 
 ---
 
@@ -242,7 +310,8 @@ pip install -r requirements.txt
 # 计算核心（舍入 / 残差分配 / 跨币种 / 确定性），仅依赖标准库
 python -m unittest tests.test_calc -v
 
-# API 端到端（自动在空闲端口起真实 uvicorn：健康检查、增查、分页、422、持久化）
+# API 端到端（自动在空闲端口起真实 uvicorn：健康检查、增查、分页、收款登记/余额、
+# 超额 422 不留记录、并发不超收、持久化）
 python -m unittest tests.test_api -v
 ```
 
@@ -253,19 +322,20 @@ python -m unittest tests.test_api -v
 ```
 .
 ├── app/
-│   ├── main.py        # FastAPI 路由：健康检查 / 创建 / 查询 / 分页
+│   ├── main.py        # FastAPI 路由：健康检查 / 创建 / 查询 / 分页 / 收款登记与余额查询
 │   ├── calc.py        # Decimal 计算核心：HALF_UP + 最大余数法残差分配（纯函数）
 │   ├── currency.py    # ISO 4217 币种最小单位表 + CURRENCY_DIGITS 扩展
 │   ├── schemas.py     # Pydantic 入参/出参模型（金额一律字符串）
-│   └── db.py          # SQLite 建表 / 事务写入 / 查询（WAL）
+│   └── db.py          # SQLite 建表 / 事务写入（发票 + 收款）/ 查询（WAL）
 ├── tests/
 │   ├── test_calc.py   # 20 个计算规则单测
-│   └── test_api.py    # 真实 HTTP 端到端测试
+│   └── test_api.py    # 真实 HTTP 端到端测试（含并发收款不超收）
 ├── Dockerfile
 ├── docker-compose.yml
 ├── requirements.txt
 └── README.md
 ```
 
-存储模型：`invoices`（发票头 + 汇总金额 + 原始请求 JSON，供复算）与
-`invoice_lines`（逐行最终税额/含税及换算列）两张表，外键级联删除。
+存储模型：`invoices`（发票头 + 汇总金额 + 原始请求 JSON，供复算）、
+`invoice_lines`（逐行最终税额/含税及换算列）与 `payments`（收款登记：金额、
+币种、登记时间）三张表，均通过外键级联删除。
